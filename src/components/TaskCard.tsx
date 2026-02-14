@@ -1,19 +1,17 @@
 import { useState, useRef, useEffect } from "react";
-import { useAppStore, type Task, type TaskStatus } from "../store/app-store";
-
-const STATUS_OPTIONS: { value: TaskStatus; label: string }[] = [
-  { value: "todo", label: "📋 Todo" },
-  { value: "doing", label: "🔨 Doing" },
-  { value: "done", label: "✅ Done" },
-];
+import { useTaskStore, type Task } from "../store/task-store";
+import { useUserStore } from "../store/user-store";
 
 export function TaskCard({ task }: { task: Task }) {
-  const { updateTaskTitle, moveTask, deleteTask } = useAppStore();
+  const { updateTaskTitle, moveTask, deleteTask, assignTask } = useTaskStore();
+  const users = useUserStore((s) => s.users);
+
   const [editing, setEditing] = useState(false);
   const [editValue, setEditValue] = useState(task.title);
   const inputRef = useRef<HTMLInputElement>(null);
 
   const isTemp = task.id.startsWith("temp_");
+  const assignee = task.assigneeId ? users[task.assigneeId] : null;
 
   useEffect(() => {
     if (editing) {
@@ -22,11 +20,8 @@ export function TaskCard({ task }: { task: Task }) {
     }
   }, [editing]);
 
-  // 同步外部 title 变化 (比如回滚后)
   useEffect(() => {
-    if (!editing) {
-      setEditValue(task.title);
-    }
+    if (!editing) setEditValue(task.title);
   }, [task.title, editing]);
 
   const handleSave = () => {
@@ -38,11 +33,13 @@ export function TaskCard({ task }: { task: Task }) {
     }
   };
 
-  const handleMove = (newStatus: TaskStatus) => {
-    if (newStatus !== task.status) {
-      moveTask(task.id, newStatus);
-    }
-  };
+  const STATUS_OPTIONS = [
+    { value: "todo" as const, label: "📋 Todo" },
+    { value: "doing" as const, label: "🔨 Doing" },
+    { value: "done" as const, label: "✅ Done" },
+  ];
+
+  const userList = Object.values(users);
 
   return (
     <div
@@ -84,12 +81,34 @@ export function TaskCard({ task }: { task: Task }) {
         </div>
       )}
 
+      {/* Assignee */}
+      <div className="mt-1.5 flex items-center gap-1.5">
+        <span className="text-[10px] text-gray-400">指派:</span>
+        <select
+          value={task.assigneeId ?? ""}
+          onChange={(e) => assignTask(task.id, e.target.value || null)}
+          className="rounded border border-gray-200 bg-gray-50 px-1.5 py-0.5 text-[11px] text-gray-600 outline-none focus:border-blue-300"
+        >
+          <option value="">无</option>
+          {userList.map((u) => (
+            <option key={u.id} value={u.id}>
+              {u.avatar} {u.name}
+            </option>
+          ))}
+        </select>
+        {assignee && (
+          <span className="text-xs" title={assignee.name}>
+            {assignee.avatar}
+          </span>
+        )}
+      </div>
+
       {/* Move Buttons */}
       <div className="mt-2 flex items-center gap-1">
         {STATUS_OPTIONS.filter((s) => s.value !== task.status).map((s) => (
           <button
             key={s.value}
-            onClick={() => handleMove(s.value)}
+            onClick={() => moveTask(task.id, s.value)}
             className="rounded px-1.5 py-0.5 text-xs text-gray-500 transition-colors hover:bg-gray-100 hover:text-gray-700"
           >
             → {s.label}
@@ -104,8 +123,7 @@ export function TaskCard({ task }: { task: Task }) {
         </button>
       </div>
 
-      {/* ID badge */}
-      <div className="mt-1.5 text-[10px] text-gray-300 font-mono">
+      <div className="mt-1.5 font-mono text-[10px] text-gray-300">
         {task.id}
       </div>
     </div>

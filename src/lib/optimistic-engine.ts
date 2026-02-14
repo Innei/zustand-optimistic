@@ -1,11 +1,8 @@
 /**
- * Zustand Optimistic Update Engine
+ * Zustand Optimistic Update Engine (Multi-Store)
  *
- * 利用 immer 的 produceWithPatches 实现:
- * 1. 捕获精确的 patches + inversePatches
- * 2. 立即 apply 到 state (乐观更新)
- * 3. 异步执行远程操作
- * 4. 失败时通过 inversePatches 回滚 + rebase 后续 mutations
+ * Engine 不绑定任何 store, 是纯粹的 patch 调度器.
+ * Store 引用在 tx.set() 时传入, 避免环引用.
  */
 
 import {
@@ -14,260 +11,271 @@ import {
   applyPatches,
   enablePatches,
   type Patch,
-} from 'immer'
-import type { StoreApi } from 'zustand'
+} from "immer";
+import type { StoreApi } from "zustand";
 
-enablePatches()
+enablePatches();
 
 // ============================================================
 // Types
 // ============================================================
 
 export type MutationStatus =
-  | 'pending'
-  | 'inflight'
-  | 'success'
-  | 'failed'
-  | 'rolled-back'
+  | "pending"
+  | "inflight"
+  | "success"
+  | "failed"
+  | "rolled-back";
+
+interface StorePatchEntry {
+  patches: Patch[];
+  inversePatches: Patch[];
+}
 
 export interface Mutation {
-  id: string
-  timestamp: number
-  status: MutationStatus
+  id: string;
+  timestamp: number;
+  status: MutationStatus;
+  storePatches: Map<StoreApi<any>, StorePatchEntry>;
+  affectedPaths: string[];
+  remoteFn: () => Promise<void>;
+  retryCount: number;
+  maxRetries: number;
+  actionName?: string;
+}
 
-  patches: Patch[]
-  inversePatches: Patch[]
-  affectedPaths: string[]
-
-  remoteFn: () => Promise<void>
-
-  retryCount: number
-  maxRetries: number
-
-  actionName?: string
+export interface MutationSnapshot {
+  id: string;
+  timestamp: number;
+  status: MutationStatus;
+  actionName?: string;
+  patchCount: number;
+  affectedPaths: string[];
+  retryCount: number;
+  maxRetries: number;
 }
 
 export interface OptimisticEngineOptions {
-  maxRetries?: number
-  onMutationError?: (mutation: Mutation, error: unknown) => void
-  onMutationSuccess?: (mutation: Mutation) => void
-  /** 当 queue 状态变化时触发 (用于 React 订阅) */
-  onQueueChange?: (mutations: Mutation[]) => void
+  maxRetries?: number;
+  onMutationError?: (snapshot: MutationSnapshot, error: unknown) => void;
+  onMutationSuccess?: (snapshot: MutationSnapshot) => void;
+  onQueueChange?: (snapshots: MutationSnapshot[]) => void;
 }
 
-type Recipe<S> = (draft: Draft<S>) => void
-type RemoteFn = () => Promise<void>
+type Recipe<S> = (draft: Draft<S>) => void;
+type RemoteFn = () => Promise<void>;
+
+interface SetOptions {
+  flush?: boolean;
+}
 
 // ============================================================
 // Path Utilities
 // ============================================================
 
-/**
- * 从 immer patches 中提取受影响的实体级路径
- *
- * ['items', '123', 'title'] → 'items.123'
- * ['folders', 'f1', 'itemIds', '0'] → 'folders.f1'
- */
 export function extractAffectedPaths(patches: Patch[]): string[] {
-  const paths = new Set<string>()
+  const paths = new Set<string>();
   for (const patch of patches) {
-    const depth = Math.min(patch.path.length, 2)
-    const entityPath = patch.path.slice(0, depth).join('.')
-    paths.add(entityPath)
+    const depth = Math.min(patch.path.length, 2);
+    const entityPath = patch.path.slice(0, depth).join(".");
+    paths.add(entityPath);
   }
-  return Array.from(paths)
+  return Array.from(paths);
 }
 
-/**
- * 路径冲突检测 (包括父子关系)
- */
 export function hasPathConflict(pathsA: string[], pathsB: string[]): boolean {
   for (const a of pathsA) {
     for (const b of pathsB) {
-      if (a === b || a.startsWith(b + '.') || b.startsWith(a + '.')) {
-        return true
+      if (a === b || a.startsWith(b + ".") || b.startsWith(a + ".")) {
+        return true;
       }
     }
   }
-  return false
+  return false;
+}
+
+// ============================================================
+// Snapshot
+// ============================================================
+
+function toSnapshot(m: Mutation): MutationSnapshot {
+  let patchCount = 0;
+  for (const entry of m.storePatches.values()) {
+    patchCount += entry.patches.length;
+  }
+  return {
+    id: m.id,
+    timestamp: m.timestamp,
+    status: m.status,
+    actionName: m.actionName,
+    patchCount,
+    affectedPaths: m.affectedPaths,
+    retryCount: m.retryCount,
+    maxRetries: m.maxRetries,
+  };
 }
 
 // ============================================================
 // Mutation Queue
 // ============================================================
 
-export class MutationQueue<S extends object> {
-  private queue: Mutation[] = []
-  private store: StoreApi<S>
-  private options: Required<OptimisticEngineOptions>
+class MutationQueue {
+  private queue: Mutation[] = [];
+  private inflightIds = new Set<string>();
+  private history: MutationSnapshot[] = [];
+  private maxHistory = 20;
+  private options: Required<OptimisticEngineOptions>;
 
-  /** 历史记录 (用于 UI 展示已完成/失败的 mutations) */
-  private history: Mutation[] = []
-  private maxHistory = 20
-
-  constructor(store: StoreApi<S>, options: OptimisticEngineOptions = {}) {
-    this.store = store
+  constructor(options: OptimisticEngineOptions = {}) {
     this.options = {
-      maxRetries: options.maxRetries ?? 2,
+      maxRetries: options.maxRetries ?? 0,
       onMutationError: options.onMutationError ?? (() => {}),
       onMutationSuccess: options.onMutationSuccess ?? (() => {}),
       onQueueChange: options.onQueueChange ?? (() => {}),
-    }
+    };
   }
 
   get mutations(): readonly Mutation[] {
-    return this.queue
-  }
-
-  /** 包含历史记录的完整列表 */
-  get allMutations(): readonly Mutation[] {
-    return [...this.queue, ...this.history]
+    return this.queue;
   }
 
   get hasPending(): boolean {
     return this.queue.some(
-      (m) => m.status === 'pending' || m.status === 'inflight',
-    )
+      (m) => m.status === "pending" || m.status === "inflight"
+    );
   }
 
   private notify() {
-    // 必须发送深拷贝: queue 中的 mutation 对象是可变的工作状态,
-    // 但 onQueueChange 回调可能将它们写入 immer store, immer 会 freeze 它们,
-    // 导致后续 mutation.status = "inflight" 写入 frozen 对象报错
-    const snapshot = [...this.queue, ...this.history].map((m) => ({ ...m }))
-    this.options.onQueueChange(snapshot)
+    const snapshots = [...this.queue.map(toSnapshot), ...this.history];
+    this.options.onQueueChange(snapshots);
   }
 
-  private addToHistory(mutation: Mutation) {
-    this.history.unshift(mutation)
+  private addToHistory(snapshot: MutationSnapshot) {
+    this.history.unshift(snapshot);
     if (this.history.length > this.maxHistory) {
-      this.history = this.history.slice(0, this.maxHistory)
+      this.history = this.history.slice(0, this.maxHistory);
     }
   }
 
   enqueue(mutation: Mutation): void {
-    this.queue.push(mutation)
-    this.notify()
-    this.processNext()
+    this.queue.push(mutation);
+    this.notify();
+    this.processNext();
   }
-
-  /**
-   * 调度: 每个 mutation 独立执行, 不互相阻塞
-   *
-   * inflight 的 mutation id 集合用于防止重复调度
-   */
-  private inflightIds = new Set<string>()
 
   private processNext(): void {
     const pending = this.queue.filter(
-      (m) => m.status === 'pending' && !this.inflightIds.has(m.id),
-    )
-
+      (m) => m.status === "pending" && !this.inflightIds.has(m.id)
+    );
     for (const mutation of pending) {
-      this.executeMutation(mutation)
+      this.executeMutation(mutation);
     }
   }
 
   private async executeMutation(mutation: Mutation): Promise<void> {
-    this.inflightIds.add(mutation.id)
-    mutation.status = 'inflight'
-    this.notify()
+    this.inflightIds.add(mutation.id);
+    mutation.status = "inflight";
+    this.notify();
 
     try {
-      await mutation.remoteFn()
+      await mutation.remoteFn();
 
-      // 成功
-      mutation.status = 'success'
-      this.inflightIds.delete(mutation.id)
-      this.addToHistory({ ...mutation })
-      this.queue = this.queue.filter((m) => m.id !== mutation.id)
-      this.notify()
-      this.options.onMutationSuccess(mutation)
+      mutation.status = "success";
+      this.inflightIds.delete(mutation.id);
+      this.addToHistory(toSnapshot(mutation));
+      this.queue = this.queue.filter((m) => m.id !== mutation.id);
+      this.notify();
+      this.options.onMutationSuccess(toSnapshot(mutation));
     } catch (error) {
-      mutation.retryCount++
+      mutation.retryCount++;
 
       if (mutation.retryCount <= mutation.maxRetries) {
-        mutation.status = 'pending'
-        this.inflightIds.delete(mutation.id)
-        this.notify()
-        this.processNext()
-        return
+        mutation.status = "pending";
+        this.inflightIds.delete(mutation.id);
+        this.notify();
+        this.processNext();
+        return;
       }
 
-      // 超过重试次数: 回滚
-      mutation.status = 'failed'
-      this.inflightIds.delete(mutation.id)
-      this.notify()
+      mutation.status = "failed";
+      this.inflightIds.delete(mutation.id);
+      this.notify();
 
-      this.rollback(mutation)
+      this.rollback(mutation);
 
-      this.addToHistory({ ...mutation, status: 'rolled-back' })
-      this.queue = this.queue.filter((m) => m.id !== mutation.id)
-      this.notify()
-      this.options.onMutationError(mutation, error)
+      const snapshot: MutationSnapshot = {
+        ...toSnapshot(mutation),
+        status: "rolled-back",
+      };
+      this.addToHistory(snapshot);
+      this.queue = this.queue.filter((m) => m.id !== mutation.id);
+      this.notify();
+      this.options.onMutationError(snapshot, error);
     }
   }
 
   /**
-   * Full Rebase 回滚策略:
-   *
-   * 并发模式下, queue 中可能同时有 pending 和 inflight 的 mutations,
-   * 它们的 patches 都已经 apply 到了 state 上.
-   *
-   * 回滚步骤:
-   * 1. 逆序回滚所有 remaining mutations (pending + inflight)
-   * 2. 回滚失败的 mutation
-   * 3. 正序重新应用 remaining mutations
+   * Multi-Store Full Rebase
    */
   private rollback(failedMutation: Mutation): void {
-    const currentState = this.store.getState()
-
-    // 收集所有还在 queue 中的 mutations (除了失败的那个), 按时间倒序
-    const remaining = this.queue
-      .filter((m) => m.id !== failedMutation.id && m.status !== 'failed')
-      .sort((a, b) => b.timestamp - a.timestamp)
-
-    let state = currentState
-
-    // Step 1: 逆序回滚所有 remaining
-    for (const m of remaining) {
-      state = applyPatches(state, m.inversePatches)
+    const allStores = new Set<StoreApi<any>>();
+    for (const store of failedMutation.storePatches.keys()) {
+      allStores.add(store);
     }
 
-    // Step 2: 回滚失败的 mutation
-    state = applyPatches(state, failedMutation.inversePatches)
+    const remaining = this.queue
+      .filter((m) => m.id !== failedMutation.id && m.status !== "failed")
+      .sort((a, b) => b.timestamp - a.timestamp);
 
-    // Step 3: 正序重新应用 remaining (rebase)
-    // 同时重新生成 patches (因为 base state 变了)
-    for (const m of [...remaining].reverse()) {
-      try {
-        const rebased = applyPatches(state, m.patches)
-        state = rebased
-      } catch {
-        // patch 无法应用 → 依赖了被回滚的数据
-        m.status = 'failed'
-        this.inflightIds.delete(m.id)
-        this.addToHistory({ ...m, status: 'rolled-back' })
-        this.options.onMutationError(
-          m,
-          new Error('Rebase failed: dependent mutation rolled back'),
-        )
+    for (const m of remaining) {
+      for (const store of m.storePatches.keys()) {
+        allStores.add(store);
       }
     }
 
-    // Step 4: 更新 store
-    this.store.setState(state as S)
+    for (const store of allStores) {
+      let state = store.getState();
 
-    // Step 5: 清理
-    this.queue = this.queue.filter((m) => m.status !== 'failed')
-    this.notify()
+      for (const m of remaining) {
+        const entry = m.storePatches.get(store);
+        if (entry) {
+          state = applyPatches(state, entry.inversePatches);
+        }
+      }
+
+      const failedEntry = failedMutation.storePatches.get(store);
+      if (failedEntry) {
+        state = applyPatches(state, failedEntry.inversePatches);
+      }
+
+      for (const m of [...remaining].reverse()) {
+        const entry = m.storePatches.get(store);
+        if (!entry) continue;
+        try {
+          state = applyPatches(state, entry.patches);
+        } catch {
+          m.status = "failed";
+          this.inflightIds.delete(m.id);
+          this.addToHistory({ ...toSnapshot(m), status: "rolled-back" });
+          this.options.onMutationError(
+            toSnapshot(m),
+            new Error("Rebase failed: dependent mutation rolled back")
+          );
+        }
+      }
+
+      store.setState(state);
+    }
+
+    this.queue = this.queue.filter((m) => m.status !== "failed");
+    this.notify();
   }
 
   clear(): void {
-    this.queue = []
-    this.history = []
-    this.inflightIds.clear()
-    this.notify()
+    this.queue = [];
+    this.history = [];
+    this.inflightIds.clear();
+    this.notify();
   }
 }
 
@@ -275,104 +283,200 @@ export class MutationQueue<S extends object> {
 // Transaction
 // ============================================================
 
-export class Transaction<S extends object> {
-  private _optimistic: Recipe<S> | null = null
-  private _mutation: RemoteFn | null = null
-  private _committed = false
+interface SetRecord {
+  store: StoreApi<any>;
+  patches: Patch[];
+  inversePatches: Patch[];
+  flushed: boolean;
+}
 
+let mutationIdCounter = 0;
+
+/**
+ * D = default store state 类型.
+ * tx.set(recipe) 时 draft 类型为 Draft<D>.
+ * tx.set(store, recipe) 时 draft 类型从 store 推断.
+ */
+export class Transaction<D extends object = any> {
+  private records: SetRecord[] = [];
+  private workingStates = new Map<StoreApi<any>, any>();
+  private _mutation: RemoteFn | null = null;
+  private _committed = false;
+  private defaultStore: StoreApi<D> | null;
+
+  /** @internal */
   constructor(
     private readonly name: string,
-    private readonly executor: (
-      name: string,
-      recipe: Recipe<S>,
-      remoteFn: RemoteFn,
-    ) => void,
-  ) {}
+    private readonly enqueueFn: (mutation: Mutation) => void,
+    private readonly maxRetries: number,
+    defaultStore?: StoreApi<D>
+  ) {
+    this.defaultStore = defaultStore ?? null;
+  }
 
-  set optimistic(fn: Recipe<S>) {
-    this._optimistic = fn
+  // --- set overloads ---
+
+  /** 操作默认 store, draft 类型为 D */
+  set(recipe: Recipe<D>): void;
+  /** 操作指定 store, draft 类型从 store 推断 */
+  set<S extends object>(store: StoreApi<S>, recipe: Recipe<S>): void;
+  /** 操作指定 store, 带 options */
+  set<S extends object>(
+    store: StoreApi<S>,
+    recipe: Recipe<S>,
+    options: SetOptions
+  ): void;
+  set<S extends object>(
+    storeOrRecipe: StoreApi<S> | Recipe<D>,
+    recipeOrUndefined?: Recipe<S>,
+    maybeOptions?: SetOptions
+  ): void {
+    let store: StoreApi<any>;
+    let recipe: Recipe<any>;
+    let options: SetOptions = {};
+
+    if (typeof storeOrRecipe === "function") {
+      if (!this.defaultStore) {
+        throw new Error(
+          `[Transaction] "${this.name}": no default store. Use tx.set(store, recipe) or pass defaultStore to createTransaction.`
+        );
+      }
+      store = this.defaultStore;
+      recipe = storeOrRecipe as Recipe<any>;
+    } else {
+      store = storeOrRecipe;
+      recipe = recipeOrUndefined as Recipe<any>;
+      options = maybeOptions ?? {};
+    }
+
+    if (this._committed) {
+      throw new Error(
+        `[Transaction] "${this.name}": cannot set() after commit()`
+      );
+    }
+
+    const flush = options.flush ?? true;
+
+    const baseState = this.workingStates.has(store)
+      ? this.workingStates.get(store)
+      : store.getState();
+
+    const [nextState, patches, inversePatches] = produceWithPatches(
+      baseState,
+      recipe
+    );
+
+    if (patches.length === 0) return;
+
+    if (flush) {
+      store.setState(nextState);
+      this.workingStates.delete(store);
+    } else {
+      this.workingStates.set(store, nextState);
+    }
+
+    this.records.push({ store, patches, inversePatches, flushed: flush });
   }
 
   set mutation(fn: RemoteFn) {
-    this._mutation = fn
+    this._mutation = fn;
   }
 
   commit(): void {
     if (this._committed) {
-      if (import.meta.env?.DEV) {
-        console.warn(`[Transaction] "${this.name}" already committed`)
-      }
-      return
+      console.warn(`[Transaction] "${this.name}" already committed`);
+      return;
     }
-    if (!this._optimistic) {
+    if (this.records.length === 0) {
       throw new Error(
-        `[Transaction] "${this.name}": missing .optimistic before .commit()`,
-      )
+        `[Transaction] "${this.name}": no .set() calls before .commit()`
+      );
     }
     if (!this._mutation) {
       throw new Error(
-        `[Transaction] "${this.name}": missing .mutation before .commit()`,
-      )
+        `[Transaction] "${this.name}": missing .mutation before .commit()`
+      );
     }
 
-    this._committed = true
-    this.executor(this.name, this._optimistic, this._mutation)
-  }
-}
+    this._committed = true;
 
-// ============================================================
-// Engine Factory
-// ============================================================
+    // flush 所有未 flush 的 set
+    for (const record of this.records) {
+      if (!record.flushed) {
+        const current = record.store.getState();
+        const next = applyPatches(current, record.patches);
+        record.store.setState(next);
+        record.flushed = true;
+      }
+    }
+    this.workingStates.clear();
 
-let mutationIdCounter = 0
+    // 按 store 合并 patches
+    const storePatches = new Map<StoreApi<any>, StorePatchEntry>();
 
-export function createOptimisticEngine<S extends object>(
-  store: StoreApi<S>,
-  options: OptimisticEngineOptions = {},
-) {
-  const queue = new MutationQueue<S>(store, options)
-  const maxRetries = options.maxRetries ?? 2
+    for (const record of this.records) {
+      const existing = storePatches.get(record.store);
+      if (existing) {
+        existing.patches.push(...record.patches);
+        existing.inversePatches.push(...record.inversePatches);
+      } else {
+        storePatches.set(record.store, {
+          patches: [...record.patches],
+          inversePatches: [...record.inversePatches],
+        });
+      }
+    }
 
-  function execute(
-    actionName: string,
-    recipe: Recipe<S>,
-    remoteFn: RemoteFn,
-  ): void {
-    const currentState = store.getState()
-
-    const [nextState, patches, inversePatches] = produceWithPatches(
-      currentState,
-      recipe,
-    )
-
-    if (patches.length === 0) return
-
-    // 立即更新 UI
-    store.setState(nextState as S)
+    const allAffectedPaths: string[] = [];
+    for (const [, entry] of storePatches) {
+      allAffectedPaths.push(...extractAffectedPaths(entry.patches));
+    }
 
     const mutation: Mutation = {
       id: `m_${++mutationIdCounter}_${Date.now()}`,
       timestamp: Date.now(),
-      status: 'pending',
-      patches,
-      inversePatches,
-      affectedPaths: extractAffectedPaths(patches),
-      remoteFn,
+      status: "pending",
+      storePatches,
+      affectedPaths: allAffectedPaths,
+      remoteFn: this._mutation,
       retryCount: 0,
-      maxRetries,
-      actionName,
-    }
+      maxRetries: this.maxRetries,
+      actionName: this.name,
+    };
 
-    queue.enqueue(mutation)
+    this.enqueueFn(mutation);
   }
+}
+
+// ============================================================
+// Engine
+// ============================================================
+
+export function createOptimisticEngine(
+  options: OptimisticEngineOptions = {}
+) {
+  const queue = new MutationQueue(options);
+  const maxRetries = options.maxRetries ?? 0;
 
   return {
-    createTransaction(name: string): Transaction<S> {
-      return new Transaction<S>(name, execute)
+    /**
+     * createTransaction('name')          → Transaction<any>, 必须 tx.set(store, fn)
+     * createTransaction('name', store)   → Transaction<S>,   可以 tx.set(fn) 操作默认 store
+     */
+    createTransaction<S extends object>(
+      name: string,
+      defaultStore?: StoreApi<S>
+    ): Transaction<S> {
+      return new Transaction<S>(
+        name,
+        (m) => queue.enqueue(m),
+        maxRetries,
+        defaultStore
+      );
     },
 
     get queue() {
-      return queue
+      return queue;
     },
-  }
+  };
 }

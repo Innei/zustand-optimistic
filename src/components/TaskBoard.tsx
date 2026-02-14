@@ -1,5 +1,5 @@
 import { useState } from "react";
-import { useAppStore, type TaskStatus } from "../store/app-store";
+import { useTaskStore, type TaskStatus, type Task } from "../store/task-store";
 import { TaskCard } from "./TaskCard";
 
 const COLUMNS: { status: TaskStatus; label: string; color: string }[] = [
@@ -13,8 +13,8 @@ const COLUMNS: { status: TaskStatus; label: string; color: string }[] = [
 ];
 
 export function TaskBoard() {
-  const tasks = useAppStore((s) => s.tasks);
-  const createTask = useAppStore((s) => s.createTask);
+  const tasks = useTaskStore((s) => s.tasks);
+  const createTask = useTaskStore((s) => s.createTask);
 
   return (
     <div className="grid grid-cols-3 gap-4">
@@ -33,7 +33,6 @@ export function TaskBoard() {
 }
 
 function Column({
-  status,
   label,
   color,
   tasks,
@@ -42,7 +41,7 @@ function Column({
   status: TaskStatus;
   label: string;
   color: string;
-  tasks: ReturnType<typeof useAppStore.getState>["tasks"][string][];
+  tasks: Task[];
   onCreateTask: (title: string) => void;
 }) {
   const [newTitle, setNewTitle] = useState("");
@@ -69,7 +68,6 @@ function Column({
         ))}
       </div>
 
-      {/* Quick Create */}
       <div className="mt-3 flex gap-1.5">
         <input
           value={newTitle}

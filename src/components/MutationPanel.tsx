@@ -1,4 +1,4 @@
-import { useAppStore } from "../store/app-store";
+import { useUIStore } from "../store/ui-store";
 import type { MutationStatus } from "../lib/optimistic-engine";
 
 const STATUS_STYLES: Record<
@@ -21,14 +21,12 @@ const STATUS_STYLES: Record<
 };
 
 export function MutationPanel() {
-  const queueSnapshot = useAppStore((s) => s.queueSnapshot);
+  const queueSnapshot = useUIStore((s) => s.queueSnapshot);
 
   return (
     <div className="rounded-xl border-2 border-gray-200 bg-white">
       <div className="border-b border-gray-100 px-4 py-3">
-        <h2 className="text-sm font-bold text-gray-700">
-          🔄 Mutation Queue
-        </h2>
+        <h2 className="text-sm font-bold text-gray-700">🔄 Mutation Queue</h2>
         <p className="mt-0.5 text-[11px] text-gray-400">
           实时展示乐观更新的 mutation 生命周期
         </p>
@@ -37,7 +35,7 @@ export function MutationPanel() {
       <div className="max-h-[500px] overflow-y-auto">
         {queueSnapshot.length === 0 ? (
           <div className="px-4 py-8 text-center text-xs text-gray-300">
-            暂无 mutations — 试试修改任务标题或移动任务
+            暂无 mutations — 试试修改任务标题或分配用户
           </div>
         ) : (
           <div className="divide-y divide-gray-50">
@@ -57,12 +55,8 @@ export function MutationPanel() {
                   </div>
 
                   <div className="mt-1 flex items-center gap-3 text-[10px] text-gray-400">
-                    <span>
-                      patches: {m.patches.length}
-                    </span>
-                    <span>
-                      paths: {m.affectedPaths.join(", ")}
-                    </span>
+                    <span>patches: {m.patchCount}</span>
+                    <span>paths: {m.affectedPaths.join(", ")}</span>
                     {m.retryCount > 0 && (
                       <span className="text-orange-400">
                         retry: {m.retryCount}/{m.maxRetries}

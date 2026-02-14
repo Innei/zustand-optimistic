@@ -1,5 +1,5 @@
 import { useEffect, useState, useRef } from "react";
-import { useAppStore } from "../store/app-store";
+import { useUIStore } from "../store/ui-store";
 
 interface ToastItem {
   id: string;
@@ -8,13 +8,9 @@ interface ToastItem {
   timestamp: number;
 }
 
-/**
- * 简单的 Toast 系统
- * 监听 queueSnapshot 的变化, 自动弹出成功/失败提示
- */
 export function ToastContainer() {
   const [toasts, setToasts] = useState<ToastItem[]>([]);
-  const queueSnapshot = useAppStore((s) => s.queueSnapshot);
+  const queueSnapshot = useUIStore((s) => s.queueSnapshot);
   const seenIds = useRef(new Set<string>());
 
   useEffect(() => {
@@ -47,7 +43,6 @@ export function ToastContainer() {
     }
   }, [queueSnapshot]);
 
-  // 自动移除
   useEffect(() => {
     if (toasts.length === 0) return;
     const timer = setInterval(() => {

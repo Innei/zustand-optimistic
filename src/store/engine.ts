@@ -20,7 +20,7 @@ export function setQueueChangeListener(
 }
 
 export const engine = createOptimisticEngine({
-  maxRetries: 0,
+  maxRetries: 1,
   onMutationError: (snapshot, error) => {
     console.warn(`[Optimistic] Rolled back: ${snapshot.actionName}`, error);
   },

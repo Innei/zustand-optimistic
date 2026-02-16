@@ -20,6 +20,29 @@ enablePatches();
 // Types
 // ============================================================
 
+type StoreState = object;
+type StoreHandle<S extends StoreState = StoreState> = Pick<
+  StoreApi<S>,
+  "getState" | "setState"
+>;
+type AnyStore = StoreHandle<StoreState>;
+
+function asAnyStore<S extends StoreState>(store: StoreHandle<S>): AnyStore {
+  return store as unknown as AnyStore;
+}
+
+const storeIdMap = new WeakMap<AnyStore, string>();
+let storeIdCounter = 0;
+
+function getStoreId(store: AnyStore): string {
+  let id = storeIdMap.get(store);
+  if (!id) {
+    id = `s_${++storeIdCounter}`;
+    storeIdMap.set(store, id);
+  }
+  return id;
+}
+
 export type MutationStatus =
   | "pending"
   | "inflight"
@@ -36,7 +59,8 @@ export interface Mutation {
   id: string;
   timestamp: number;
   status: MutationStatus;
-  storePatches: Map<StoreApi<any>, StorePatchEntry>;
+  cancelled: boolean;
+  storePatches: Map<AnyStore, StorePatchEntry>;
   affectedPaths: string[];
   remoteFn: () => Promise<void>;
   retryCount: number;
@@ -81,6 +105,11 @@ export function extractAffectedPaths(patches: Patch[]): string[] {
     paths.add(entityPath);
   }
   return Array.from(paths);
+}
+
+function extractScopedAffectedPaths(store: AnyStore, patches: Patch[]): string[] {
+  const storeId = getStoreId(store);
+  return extractAffectedPaths(patches).map((path) => `${storeId}:${path}`);
 }
 
 export function hasPathConflict(pathsA: string[], pathsB: string[]): boolean {
@@ -157,6 +186,48 @@ class MutationQueue {
     }
   }
 
+  private getInflightMutations(): Mutation[] {
+    return this.queue.filter((m) => this.inflightIds.has(m.id));
+  }
+
+  private hasInflightConflict(candidate: Mutation): boolean {
+    for (const inflight of this.getInflightMutations()) {
+      if (hasPathConflict(candidate.affectedPaths, inflight.affectedPaths)) {
+        return true;
+      }
+    }
+    return false;
+  }
+
+  private isStaleMutation(mutation: Mutation): boolean {
+    if (mutation.cancelled || mutation.status !== "inflight") {
+      return true;
+    }
+    return !this.queue.some((m) => m.id === mutation.id);
+  }
+
+  private markMutationRolledBack(
+    mutation: Mutation,
+    reason: string,
+    error?: unknown
+  ) {
+    if (mutation.status === "failed" || mutation.cancelled) {
+      return;
+    }
+
+    mutation.status = "failed";
+    mutation.cancelled = true;
+    this.inflightIds.delete(mutation.id);
+
+    const snapshot: MutationSnapshot = {
+      ...toSnapshot(mutation),
+      status: "rolled-back",
+    };
+
+    this.addToHistory(snapshot);
+    this.options.onMutationError(snapshot, error ?? new Error(reason));
+  }
+
   enqueue(mutation: Mutation): void {
     this.queue.push(mutation);
     this.notify();
@@ -164,10 +235,14 @@ class MutationQueue {
   }
 
   private processNext(): void {
-    const pending = this.queue.filter(
-      (m) => m.status === "pending" && !this.inflightIds.has(m.id)
-    );
+    const pending = this.queue
+      .filter((m) => m.status === "pending" && !this.inflightIds.has(m.id))
+      .sort((a, b) => a.timestamp - b.timestamp);
+
     for (const mutation of pending) {
+      if (this.hasInflightConflict(mutation)) {
+        continue;
+      }
       this.executeMutation(mutation);
     }
   }
@@ -180,13 +255,28 @@ class MutationQueue {
     try {
       await mutation.remoteFn();
 
+      if (this.isStaleMutation(mutation)) {
+        this.inflightIds.delete(mutation.id);
+        this.notify();
+        this.processNext();
+        return;
+      }
+
       mutation.status = "success";
       this.inflightIds.delete(mutation.id);
       this.addToHistory(toSnapshot(mutation));
       this.queue = this.queue.filter((m) => m.id !== mutation.id);
       this.notify();
       this.options.onMutationSuccess(toSnapshot(mutation));
+      this.processNext();
     } catch (error) {
+      if (mutation.cancelled) {
+        this.inflightIds.delete(mutation.id);
+        this.notify();
+        this.processNext();
+        return;
+      }
+
       mutation.retryCount++;
 
       if (mutation.retryCount <= mutation.maxRetries) {
@@ -211,6 +301,7 @@ class MutationQueue {
       this.queue = this.queue.filter((m) => m.id !== mutation.id);
       this.notify();
       this.options.onMutationError(snapshot, error);
+      this.processNext();
     }
   }
 
@@ -218,7 +309,7 @@ class MutationQueue {
    * Multi-Store Full Rebase
    */
   private rollback(failedMutation: Mutation): void {
-    const allStores = new Set<StoreApi<any>>();
+    const allStores = new Set<AnyStore>();
     for (const store of failedMutation.storePatches.keys()) {
       allStores.add(store);
     }
@@ -238,28 +329,45 @@ class MutationQueue {
 
       for (const m of remaining) {
         const entry = m.storePatches.get(store);
-        if (entry) {
+        if (!entry) continue;
+
+        try {
           state = applyPatches(state, entry.inversePatches);
+        } catch (error) {
+          this.markMutationRolledBack(
+            m,
+            `Inverse rebase failed for "${m.actionName ?? m.id}"`,
+            error
+          );
         }
       }
 
       const failedEntry = failedMutation.storePatches.get(store);
       if (failedEntry) {
-        state = applyPatches(state, failedEntry.inversePatches);
+        try {
+          state = applyPatches(state, failedEntry.inversePatches);
+        } catch (error) {
+          this.options.onMutationError(
+            {
+              ...toSnapshot(failedMutation),
+              status: "rolled-back",
+            },
+            error
+          );
+        }
       }
 
       for (const m of [...remaining].reverse()) {
         const entry = m.storePatches.get(store);
-        if (!entry) continue;
+        if (!entry || m.status === "failed") continue;
+
         try {
           state = applyPatches(state, entry.patches);
-        } catch {
-          m.status = "failed";
-          this.inflightIds.delete(m.id);
-          this.addToHistory({ ...toSnapshot(m), status: "rolled-back" });
-          this.options.onMutationError(
-            toSnapshot(m),
-            new Error("Rebase failed: dependent mutation rolled back")
+        } catch (error) {
+          this.markMutationRolledBack(
+            m,
+            `Rebase failed for dependent mutation "${m.actionName ?? m.id}"`,
+            error
           );
         }
       }
@@ -284,7 +392,7 @@ class MutationQueue {
 // ============================================================
 
 interface SetRecord {
-  store: StoreApi<any>;
+  store: AnyStore;
   patches: Patch[];
   inversePatches: Patch[];
   flushed: boolean;
@@ -297,21 +405,27 @@ let mutationIdCounter = 0;
  * tx.set(recipe) 时 draft 类型为 Draft<D>.
  * tx.set(store, recipe) 时 draft 类型从 store 推断.
  */
-export class Transaction<D extends object = any> {
+export class Transaction<D extends StoreState = Record<string, never>> {
+  private readonly name: string;
+  private readonly enqueueFn: (mutation: Mutation) => void;
+  private readonly maxRetries: number;
   private records: SetRecord[] = [];
-  private workingStates = new Map<StoreApi<any>, any>();
+  private workingStates = new Map<AnyStore, StoreState>();
   private _mutation: RemoteFn | null = null;
   private _committed = false;
-  private defaultStore: StoreApi<D> | null;
+  private defaultStore: AnyStore | null;
 
   /** @internal */
   constructor(
-    private readonly name: string,
-    private readonly enqueueFn: (mutation: Mutation) => void,
-    private readonly maxRetries: number,
-    defaultStore?: StoreApi<D>
+    name: string,
+    enqueueFn: (mutation: Mutation) => void,
+    maxRetries: number,
+    defaultStore?: StoreHandle<D>
   ) {
-    this.defaultStore = defaultStore ?? null;
+    this.name = name;
+    this.enqueueFn = enqueueFn;
+    this.maxRetries = maxRetries;
+    this.defaultStore = defaultStore ? asAnyStore(defaultStore) : null;
   }
 
   // --- set overloads ---
@@ -319,20 +433,20 @@ export class Transaction<D extends object = any> {
   /** 操作默认 store, draft 类型为 D */
   set(recipe: Recipe<D>): void;
   /** 操作指定 store, draft 类型从 store 推断 */
-  set<S extends object>(store: StoreApi<S>, recipe: Recipe<S>): void;
+  set<S extends StoreState>(store: StoreHandle<S>, recipe: Recipe<S>): void;
   /** 操作指定 store, 带 options */
-  set<S extends object>(
-    store: StoreApi<S>,
+  set<S extends StoreState>(
+    store: StoreHandle<S>,
     recipe: Recipe<S>,
     options: SetOptions
   ): void;
-  set<S extends object>(
-    storeOrRecipe: StoreApi<S> | Recipe<D>,
+  set<S extends StoreState>(
+    storeOrRecipe: StoreHandle<S> | Recipe<D>,
     recipeOrUndefined?: Recipe<S>,
     maybeOptions?: SetOptions
   ): void {
-    let store: StoreApi<any>;
-    let recipe: Recipe<any>;
+    let store: AnyStore;
+    let recipe: Recipe<StoreState>;
     let options: SetOptions = {};
 
     if (typeof storeOrRecipe === "function") {
@@ -342,10 +456,10 @@ export class Transaction<D extends object = any> {
         );
       }
       store = this.defaultStore;
-      recipe = storeOrRecipe as Recipe<any>;
+      recipe = storeOrRecipe as unknown as Recipe<StoreState>;
     } else {
-      store = storeOrRecipe;
-      recipe = recipeOrUndefined as Recipe<any>;
+      store = asAnyStore(storeOrRecipe);
+      recipe = recipeOrUndefined as unknown as Recipe<StoreState>;
       options = maybeOptions ?? {};
     }
 
@@ -357,9 +471,8 @@ export class Transaction<D extends object = any> {
 
     const flush = options.flush ?? true;
 
-    const baseState = this.workingStates.has(store)
-      ? this.workingStates.get(store)
-      : store.getState();
+    const baseState =
+      (this.workingStates.get(store) ?? store.getState()) as StoreState;
 
     const [nextState, patches, inversePatches] = produceWithPatches(
       baseState,
@@ -412,13 +525,17 @@ export class Transaction<D extends object = any> {
     this.workingStates.clear();
 
     // 按 store 合并 patches
-    const storePatches = new Map<StoreApi<any>, StorePatchEntry>();
+    const storePatches = new Map<AnyStore, StorePatchEntry>();
 
     for (const record of this.records) {
       const existing = storePatches.get(record.store);
       if (existing) {
         existing.patches.push(...record.patches);
-        existing.inversePatches.push(...record.inversePatches);
+        // inverse 必须逆序拼接, 否则回滚会停在中间态
+        existing.inversePatches = [
+          ...record.inversePatches,
+          ...existing.inversePatches,
+        ];
       } else {
         storePatches.set(record.store, {
           patches: [...record.patches],
@@ -428,14 +545,15 @@ export class Transaction<D extends object = any> {
     }
 
     const allAffectedPaths: string[] = [];
-    for (const [, entry] of storePatches) {
-      allAffectedPaths.push(...extractAffectedPaths(entry.patches));
+    for (const [store, entry] of storePatches) {
+      allAffectedPaths.push(...extractScopedAffectedPaths(store, entry.patches));
     }
 
     const mutation: Mutation = {
       id: `m_${++mutationIdCounter}_${Date.now()}`,
       timestamp: Date.now(),
       status: "pending",
+      cancelled: false,
       storePatches,
       affectedPaths: allAffectedPaths,
       remoteFn: this._mutation,
@@ -452,20 +570,18 @@ export class Transaction<D extends object = any> {
 // Engine
 // ============================================================
 
-export function createOptimisticEngine(
-  options: OptimisticEngineOptions = {}
-) {
+export function createOptimisticEngine(options: OptimisticEngineOptions = {}) {
   const queue = new MutationQueue(options);
   const maxRetries = options.maxRetries ?? 0;
 
   return {
     /**
-     * createTransaction('name')          → Transaction<any>, 必须 tx.set(store, fn)
-     * createTransaction('name', store)   → Transaction<S>,   可以 tx.set(fn) 操作默认 store
+     * createTransaction('name')          → Transaction<object>, 必须 tx.set(store, fn)
+     * createTransaction('name', store)   → Transaction<S>,      可以 tx.set(fn) 操作默认 store
      */
-    createTransaction<S extends object>(
+    createTransaction<S extends StoreState>(
       name: string,
-      defaultStore?: StoreApi<S>
+      defaultStore?: StoreHandle<S>
     ): Transaction<S> {
       return new Transaction<S>(
         name,

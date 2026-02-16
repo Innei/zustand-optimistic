@@ -2,6 +2,7 @@ import { TaskBoard } from "./components/TaskBoard";
 import { UserPanel } from "./components/UserPanel";
 import { MutationPanel } from "./components/MutationPanel";
 import { ApiControls } from "./components/ApiControls";
+import { ExtremeCasesPanel } from "./components/ExtremeCasesPanel";
 import { ToastContainer } from "./components/Toast";
 
 export default function App() {
@@ -51,6 +52,7 @@ export default function App() {
           {/* Right */}
           <div className="space-y-4">
             <ApiControls />
+            <ExtremeCasesPanel />
             <UserPanel />
             <MutationPanel />
           </div>

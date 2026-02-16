@@ -3,14 +3,18 @@ import { useTaskStore, type Task } from "../store/task-store";
 import { useUserStore } from "../store/user-store";
 
 export function TaskCard({ task }: { task: Task }) {
-  const { updateTaskTitle, moveTask, deleteTask, assignTask } = useTaskStore();
+  const updateTaskTitle = useTaskStore((s) => s.updateTaskTitle);
+  const moveTask = useTaskStore((s) => s.moveTask);
+  const deleteTask = useTaskStore((s) => s.deleteTask);
+  const assignTask = useTaskStore((s) => s.assignTask);
   const users = useUserStore((s) => s.users);
 
   const [editing, setEditing] = useState(false);
-  const [editValue, setEditValue] = useState(task.title);
+  const [draftTitle, setDraftTitle] = useState<string | null>(null);
   const inputRef = useRef<HTMLInputElement>(null);
 
-  const isTemp = task.id.startsWith("temp_");
+  const editValue = draftTitle ?? task.title;
+  const isPendingSync = task.syncState === "pending";
   const assignee = task.assigneeId ? users[task.assigneeId] : null;
 
   useEffect(() => {
@@ -20,16 +24,21 @@ export function TaskCard({ task }: { task: Task }) {
     }
   }, [editing]);
 
-  useEffect(() => {
-    if (!editing) setEditValue(task.title);
-  }, [task.title, editing]);
+  const beginEdit = () => {
+    setDraftTitle(task.title);
+    setEditing(true);
+  };
+
+  const cancelEdit = () => {
+    setEditing(false);
+    setDraftTitle(null);
+  };
 
   const handleSave = () => {
-    setEditing(false);
-    if (editValue.trim() && editValue !== task.title) {
-      updateTaskTitle(task.id, editValue.trim());
-    } else {
-      setEditValue(task.title);
+    const nextTitle = editValue.trim();
+    cancelEdit();
+    if (nextTitle && nextTitle !== task.title) {
+      updateTaskTitle(task.id, nextTitle);
     }
   };
 
@@ -46,7 +55,7 @@ export function TaskCard({ task }: { task: Task }) {
       className={`
         group relative rounded-lg border bg-white p-3 shadow-sm
         transition-all duration-200
-        ${isTemp ? "border-dashed border-blue-300 bg-blue-50/50" : "border-gray-200"}
+        ${isPendingSync ? "border-dashed border-blue-300 bg-blue-50/50" : "border-gray-200"}
         hover:shadow-md
       `}
     >
@@ -55,13 +64,12 @@ export function TaskCard({ task }: { task: Task }) {
         <input
           ref={inputRef}
           value={editValue}
-          onChange={(e) => setEditValue(e.target.value)}
+          onChange={(e) => setDraftTitle(e.target.value)}
           onBlur={handleSave}
           onKeyDown={(e) => {
             if (e.key === "Enter") handleSave();
             if (e.key === "Escape") {
-              setEditValue(task.title);
-              setEditing(false);
+              cancelEdit();
             }
           }}
           className="w-full rounded border border-blue-300 px-2 py-1 text-sm outline-none focus:ring-2 focus:ring-blue-400"
@@ -69,11 +77,11 @@ export function TaskCard({ task }: { task: Task }) {
       ) : (
         <div
           className="cursor-pointer text-sm font-medium text-gray-800 hover:text-blue-600"
-          onClick={() => setEditing(true)}
+          onClick={beginEdit}
           title="点击编辑标题"
         >
           {task.title}
-          {isTemp && (
+          {isPendingSync && (
             <span className="ml-1.5 inline-block animate-pulse text-xs text-blue-400">
               (创建中...)
             </span>
@@ -123,9 +131,7 @@ export function TaskCard({ task }: { task: Task }) {
         </button>
       </div>
 
-      <div className="mt-1.5 font-mono text-[10px] text-gray-300">
-        {task.id}
-      </div>
+      <div className="mt-1.5 font-mono text-[10px] text-gray-300">{task.id}</div>
     </div>
   );
 }

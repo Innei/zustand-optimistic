@@ -54,7 +54,7 @@ const INITIAL_USERS: Record<string, User> = {
 // ============================================================
 
 export const userStore = createStore<UserState>()(
-  immer((_set) => ({
+  immer(() => ({
     users: INITIAL_USERS,
   }))
 );

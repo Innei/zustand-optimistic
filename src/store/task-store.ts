@@ -17,6 +17,7 @@ import { api } from "../mock/api";
 // ============================================================
 
 export type TaskStatus = "todo" | "doing" | "done";
+export type TaskSyncState = "pending" | "synced";
 
 export interface Task {
   id: string;
@@ -24,6 +25,8 @@ export interface Task {
   status: TaskStatus;
   assigneeId: string | null;
   createdAt: number;
+  serverId: string;
+  syncState: TaskSyncState;
 }
 
 interface TaskState {
@@ -34,11 +37,21 @@ interface TaskActions {
   updateTaskTitle: (taskId: string, title: string) => void;
   moveTask: (taskId: string, newStatus: TaskStatus) => void;
   deleteTask: (taskId: string) => void;
-  createTask: (title: string, status: TaskStatus) => void;
+  createTask: (title: string, status: TaskStatus) => string;
   assignTask: (taskId: string, userId: string | null) => void;
 }
 
 type Store = TaskState & TaskActions;
+
+let clientTaskCounter = 0;
+
+function createClientTaskId() {
+  return `task_local_${Date.now()}_${++clientTaskCounter}`;
+}
+
+function getRemoteTaskId(task: Task) {
+  return task.serverId || task.id;
+}
 
 // ============================================================
 // Initial Data
@@ -51,6 +64,8 @@ const INITIAL_TASKS: Record<string, Task> = {
     status: "done",
     assigneeId: null,
     createdAt: Date.now() - 5000,
+    serverId: "task1",
+    syncState: "synced",
   },
   task2: {
     id: "task2",
@@ -58,6 +73,8 @@ const INITIAL_TASKS: Record<string, Task> = {
     status: "doing",
     assigneeId: "user1",
     createdAt: Date.now() - 4000,
+    serverId: "task2",
+    syncState: "synced",
   },
   task3: {
     id: "task3",
@@ -65,6 +82,8 @@ const INITIAL_TASKS: Record<string, Task> = {
     status: "doing",
     assigneeId: "user2",
     createdAt: Date.now() - 3000,
+    serverId: "task3",
+    syncState: "synced",
   },
   task4: {
     id: "task4",
@@ -72,6 +91,8 @@ const INITIAL_TASKS: Record<string, Task> = {
     status: "todo",
     assigneeId: null,
     createdAt: Date.now() - 2000,
+    serverId: "task4",
+    syncState: "synced",
   },
   task5: {
     id: "task5",
@@ -79,6 +100,8 @@ const INITIAL_TASKS: Record<string, Task> = {
     status: "todo",
     assigneeId: null,
     createdAt: Date.now() - 1000,
+    serverId: "task5",
+    syncState: "synced",
   },
   task6: {
     id: "task6",
@@ -86,6 +109,8 @@ const INITIAL_TASKS: Record<string, Task> = {
     status: "todo",
     assigneeId: null,
     createdAt: Date.now(),
+    serverId: "task6",
+    syncState: "synced",
   },
 };
 
@@ -98,25 +123,31 @@ export const taskStore = createStore<Store>()(
     tasks: INITIAL_TASKS,
 
     updateTaskTitle: (taskId, title) => {
-      const tx = engine.createTransaction(
-        `updateTitle(${taskId})`,
-        taskStore
-      );
+      const currentTask = get().tasks[taskId];
+      const trimmed = title.trim();
+      if (!currentTask || !trimmed || currentTask.title === trimmed) return;
+
+      const remoteTaskId = getRemoteTaskId(currentTask);
+      const tx = engine.createTransaction(`updateTitle(${taskId})`, taskStore);
 
       tx.set((draft) => {
         const task = draft.tasks[taskId];
         if (!task) return;
-        task.title = title;
+        task.title = trimmed;
       });
 
       tx.mutation = async () => {
-        await api.updateTask(taskId, { title });
+        await api.updateTask(remoteTaskId, { title: trimmed });
       };
 
       tx.commit();
     },
 
     moveTask: (taskId, newStatus) => {
+      const currentTask = get().tasks[taskId];
+      if (!currentTask || currentTask.status === newStatus) return;
+
+      const remoteTaskId = getRemoteTaskId(currentTask);
       const tx = engine.createTransaction(
         `moveTask(${taskId} → ${newStatus})`,
         taskStore
@@ -129,7 +160,7 @@ export const taskStore = createStore<Store>()(
       });
 
       tx.mutation = async () => {
-        await api.moveTask(taskId, newStatus);
+        await api.moveTask(remoteTaskId, newStatus);
       };
 
       tx.commit();
@@ -137,10 +168,13 @@ export const taskStore = createStore<Store>()(
 
     deleteTask: (taskId) => {
       const currentTask = get().tasks[taskId];
+      if (!currentTask) return;
+
+      const remoteTaskId = getRemoteTaskId(currentTask);
       const tx = engine.createTransaction(`deleteTask(${taskId})`, taskStore);
 
       // 如果有 assignee, 先从 userStore 中移除引用
-      if (currentTask?.assigneeId) {
+      if (currentTask.assigneeId) {
         const assigneeId = currentTask.assigneeId;
         tx.set(userStore, (draft) => {
           const user = draft.users[assigneeId];
@@ -157,38 +191,43 @@ export const taskStore = createStore<Store>()(
       });
 
       tx.mutation = async () => {
-        await api.deleteTask(taskId);
+        await api.deleteTask(remoteTaskId);
       };
 
       tx.commit();
     },
 
     createTask: (title, status) => {
-      const tempId = `temp_${Date.now()}`;
-      const tx = engine.createTransaction(`createTask("${title}")`, taskStore);
+      const trimmed = title.trim();
+      if (!trimmed) return "";
+
+      const clientId = createClientTaskId();
+      const tx = engine.createTransaction(`createTask("${trimmed}")`, taskStore);
 
       tx.set((draft) => {
-        draft.tasks[tempId] = {
-          id: tempId,
-          title,
+        draft.tasks[clientId] = {
+          id: clientId,
+          title: trimmed,
           status,
           assigneeId: null,
           createdAt: Date.now(),
+          serverId: clientId,
+          syncState: "pending",
         };
       });
 
       tx.mutation = async () => {
-        const result = await api.createTask({ title, status });
+        const result = await api.createTask({ id: clientId, title: trimmed, status });
         set((draft) => {
-          const task = draft.tasks[tempId];
+          const task = draft.tasks[clientId];
           if (!task) return;
-          task.id = result.id;
-          draft.tasks[result.id] = task;
-          delete draft.tasks[tempId];
+          task.serverId = result.id;
+          task.syncState = "synced";
         });
       };
 
       tx.commit();
+      return clientId;
     },
 
     assignTask: (taskId, userId) => {
@@ -198,6 +237,7 @@ export const taskStore = createStore<Store>()(
       const oldAssigneeId = currentTask.assigneeId;
       if (oldAssigneeId === userId) return;
 
+      const remoteTaskId = getRemoteTaskId(currentTask);
       const label = userId
         ? `assignTask(${taskId} → ${userId})`
         : `unassignTask(${taskId})`;
@@ -206,7 +246,9 @@ export const taskStore = createStore<Store>()(
 
       // 1. TaskStore: 更新 assigneeId
       tx.set((draft) => {
-        draft.tasks[taskId].assigneeId = userId;
+        const task = draft.tasks[taskId];
+        if (!task) return;
+        task.assigneeId = userId;
       });
 
       // 2. UserStore: 从旧 user 移除
@@ -225,14 +267,14 @@ export const taskStore = createStore<Store>()(
       if (userId) {
         tx.set(userStore, (draft) => {
           const user = draft.users[userId];
-          if (user) {
+          if (user && !user.assignedTaskIds.includes(taskId)) {
             user.assignedTaskIds.push(taskId);
           }
         });
       }
 
       tx.mutation = async () => {
-        await api.updateTask(taskId, { assigneeId: userId });
+        await api.updateTask(remoteTaskId, { assigneeId: userId });
       };
 
       tx.commit();
